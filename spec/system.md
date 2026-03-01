@@ -15,6 +15,8 @@ This two-token model separates the concern of *participating* in a transaction f
 
 > **Future feature**: Fine-grained token permissions (e.g., subtree-scoped access, read-only tokens, operation-type restrictions) are noted for potential future inclusion.
 
+Initiating a transaction isolates a snapshot of the filesystem (or parent transaction) state at that point in time and issues the two tokens. All reads within the transaction see this snapshot, plus any changes committed by subtransactions since the snapshot was taken.
+
 Transaction properties follow a modified ACID model:
 
 - **Atomicity**: All operations within a transaction commit or none do.
@@ -28,9 +30,9 @@ The temporary transaction-internal state serves dual purposes: it acts as a sand
 
 CastaneaFS employs a closed nested transaction model. Transactions form a hierarchy:
 
-- Any participant in a transaction can create **subtransactions**, which operate on an isolated copy of their parent's state.
-- A subtransaction's effects become visible to the parent (and its other subtransactions) only when the subtransaction commits.
-- **Every individual filesystem operation** by a FUSE client is implicitly wrapped in a single-operation subtransaction that commits immediately. This means that non-transactional filesystem access is a special case of the transactional model, and races between concurrent participants — whether inside a shared transaction or between independent top-level operations — are handled by the same conflict detection logic.
+- Any participant in a transaction can create **subtransactions** using the same ioctl-based API used for top-level transactions. Creating a subtransaction issues a new pair of owner and access tokens for the subtransaction, scoped to it. The subtransaction operates on an isolated copy of its parent's state at the time of creation.
+- A subtransaction's effects become visible to the parent (and its other subtransactions) only when the subtransaction commits. The subtransaction's access token can be shared with other processes, forming a nested workgroup.
+- **Every individual filesystem operation** by a FUSE client is implicitly wrapped in a single-operation subtransaction that commits immediately. If the process is not participating in any explicit transaction, this implicit subtransaction commits directly to the **hierarchy root** — the filesystem itself, which serves as the always-open implicit parent of all top-level transactions. This means that non-transactional filesystem access is a special case of the transactional model, and races between concurrent participants — whether inside a shared transaction or between independent top-level operations — are handled by the same conflict detection logic.
 
 This design yields several properties by construction:
 
@@ -63,8 +65,8 @@ No other transitions are possible. Committed and Aborted are terminal. Failed ca
 A subtransaction's commit succeeds only if **all three** conditions hold:
 
 1. The parent transaction is **open**.
-2. The subtransaction's changes do not **conflict** with changes previously committed by a sibling subtransaction.
-3. The subtransaction's changes do not violate **POSIX permission checks** (e.g., writing to a read-only file, modifying a file owned by a different user).
+2. The subtransaction's changes do not **conflict** with changes previously committed by a sibling subtransaction. This includes both data-level conflicts (concurrent writes to the same file or directory entry) and security conflicts (see Security Conflict Policy).
+3. The subtransaction's changes do not violate **POSIX permission checks** at commit time (e.g., writing to a read-only file, modifying a file owned by a different user). Permissions are evaluated against the parent's state at the time of commit, not at the time the operation was performed within the subtransaction. For implicit single-operation subtransactions, commit is immediate, so this is equivalent to checking at operation time.
 
 If any condition is violated, the committing subtransaction enters the **failed** state. This covers all failure cases uniformly:
 
@@ -94,6 +96,12 @@ As a stop-gap measure, a **CLI administration utility** (`castaneafs-admin` or s
 - **Transaction owner**: The process (or its delegates) holding the owner token for a transaction. Controls the transaction's lifecycle (commit/abort).
 - **Transaction participants**: Processes holding an access token for a transaction. Can perform filesystem operations within the transaction's scope, subject to POSIX permission checks. May create subtransactions.
 - **System administrator**: Privileged user who can inspect and force-cleanup transactions via the CLI administration utility.
+
+### Transaction Control Interface
+
+Transaction lifecycle operations (create, commit, abort, create subtransaction) are exposed via **ioctl calls** on the CastaneaFS mount. The call to create a transaction returns the access token; the owner token is returned separately. Specific ioctl numbers and argument structures are not yet finalized and will be defined during feature design.
+
+Filesystem operations within a transaction's scope are performed through standard POSIX syscalls, with the transaction context identified by its access token.
 
 ### Technology Stack
 
@@ -239,3 +247,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 
 - **2026-02-28**: Initial system design. Established two-token capability model, closed nested transaction model, failed transaction state semantics, POSIX-only permission model, CLI admin utility, and deferred persistence backend.
 - **2026-02-28**: Added Design Context (novelty analysis, ACID compositionality, nested transaction adoption) and References section (foundational literature, TLA+ specifications, testing tooling, industry practice, learning resources).
+- **2026-03-01**: Clarified snapshot timing (isolated at transaction creation), subtransaction token model (new token pair per subtransaction), transaction control interface (ioctl-based), permission check timing (at commit time), hierarchy root semantics, and security conflicts in commit rules.
