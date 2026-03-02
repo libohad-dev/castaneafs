@@ -24,7 +24,7 @@ Transaction properties follow a modified ACID model:
 - **Isolation**: Concurrent transactions observe consistent snapshots and produce serializable outcomes.
 - **Durability**: Committed transactions survive process and system crashes.
 
-The temporary transaction-internal state serves dual purposes: it acts as a sandbox for security-sensitive work (within the filesystem's threat model) and as a disposable scratchpad for exploratory workflows such as testing different design or implementation configurations with easy rollback.
+The temporary transaction-internal state serves dual purposes: it acts as a sandbox for security-sensitive work (see Threat Model below) and as a disposable scratchpad for exploratory workflows such as testing different design or implementation configurations with easy rollback.
 
 ### Closed Nested Transaction Model
 
@@ -155,6 +155,85 @@ Filesystem operations within a transaction's scope are performed through standar
 > - File change notifications (inotify-style)
 > - Network-safe token transport
 
+## Threat Model
+
+### Trust Boundaries
+
+- **Trusted**: The kernel, the FUSE kernel module, and the CastaneaFS server process. These are assumed to be correct and uncompromised.
+- **Untrusted**: All client processes. The server must validate every request and never rely on client-side state or client-side enforcement.
+- **Security boundary**: Token secrecy. A process can access a transaction's workspace if and only if it possesses a valid access token. The system does not authenticate processes by identity (uid/pid); it authenticates by token possession.
+
+### Unauthorized Access to Transaction State
+
+Transaction-internal state must be invisible to processes without the access token. Two naive approaches are rejected:
+
+- **Path-based namespaces** (e.g., `/mountpoint/.txn/<token>/...`) would leak the token through `/proc/<pid>/fd` entries, `lsof`, and similar introspection tools.
+- **Uncontrolled per-transaction mounts** where any token holder can create a globally-visible mount would expose transaction state to all processes that can traverse the mount path.
+
+CastaneaFS uses a **multi-mount architecture** with two distinct access patterns:
+
+**1. Primary mount (session-based, multiplexed views).** The server serves one primary mount point that shows the committed filesystem state by default. A process joins a transaction on this mount by calling the join-transaction ioctl with an access token. The server establishes a session binding that process to the transaction, so subsequent POSIX operations from that process are routed to the transaction's workspace. Processes without a session see the committed state.
+
+This access pattern is process-specific: a subprocess (e.g., `diff`) spawned by a session-bound process does **not** inherit the session. The subprocess would need to independently present a token to access transaction state. This is a deliberate security property — session binding is non-transferable — but it means standard tools cannot operate on transaction state through the primary mount alone.
+
+The exact session binding mechanism (PID-based mapping, FD-based scoping, or a hybrid) is a feature-design concern with security trade-offs:
+
+- *PID-based*: Simple but vulnerable to PID reuse attacks (a new process inheriting a recycled PID could gain access).
+- *FD-based*: The ioctl returns a directory FD; the process uses `openat()`-family syscalls relative to that FD. More secure (FD lifetime is tied to the process) but requires client-side adoption of `*at()` syscalls.
+- *Hybrid*: PID-based with epoch/start-time validation to mitigate reuse.
+
+The choice will be made during feature design. The system-level requirement is: **the session mechanism must not grant transaction access to any process that has not presented a valid access token**.
+
+**2. Transaction view mounts (fixed view, OS-level access control).** A user (or the admin tool) can request an additional mount point that exposes a single fixed transaction state to **all processes** that can access the mount point. Token presentation is required once, to create the mount. Access control is then handled by standard OS permissions on the mount point directory (ownership, mode bits) — the same mechanism that protects any private mount.
+
+```
+castaneafs mount --transaction <token> /mnt/castanea-txn123
+diff /mnt/castanea/path/to/file /mnt/castanea-txn123/path/to/file
+```
+
+Because the transaction view mount shows the same view to all callers, standard POSIX tools (`diff`, `rsync`, `find`, etc.) work transparently — a subprocess like `diff` simply accesses the mount point and sees the transaction state. A specialized `castaneafs diff` command is additionally desirable for atomic snapshot comparison (guaranteeing the state does not change during the diff), but standard tool support is the baseline.
+
+> **Security model shift.** Creating a transaction view mount represents a deliberate transition from CastaneaFS's token-based capability model to OS-level POSIX permission-based access control. On the primary mount, transaction state is accessible only to processes that possess the access token. Once a token holder mounts a transaction view, the state becomes accessible to *any* process with appropriate POSIX permissions on the mount point — regardless of whether that process holds a CastaneaFS token. A token holder should only mount a transaction view after verifying that the transaction state does not contain sensitive information that should remain restricted to token holders.
+
+**FUSE implementation note**: In libfuse, `fuse_context.private_data` is a `void*` set once in the filesystem's `init` callback — it stores per-filesystem-instance state, not per-request state. Per-request caller identification comes from `fuse_context.pid`, `.uid`, and `.gid`, which the kernel fills in for each request. The multi-mount approach uses separate FUSE instances (each with its own `private_data`) for each mount point: the primary mount's instance handles session multiplexing, while a transaction view mount's instance serves a fixed view without per-request identity checks.
+
+**Multiple independent filesystem trees** are orthogonal to multi-view mounts. The server manages mount points with metadata identifying both the tree and the view (committed state vs. specific transaction). This is comparable to ZFS pools/datasets, each with their own mount points. The configuration or CLI distinguishes "mount tree X's committed state at /mnt/a" from "mount tree X's transaction T at /mnt/b" from "mount tree Y at /mnt/c."
+
+### Token Leakage
+
+Tokens are the sole credential. If a token is leaked, the holder gains access. Mitigations:
+
+- **Architectural constraint 4** (token non-dissemination over network) limits the attack surface to local processes.
+- Token distribution channels (Unix domain sockets, pipes, FD passing) are protected by OS-level process isolation.
+- The server does not log tokens in plaintext.
+- Tokens are cryptographically random and of sufficient length to resist brute-force guessing.
+
+**Out of scope**: CastaneaFS does not protect against a compromised process intentionally leaking its own token, nor against a local attacker with root access reading another process's memory. These require OS-level security measures (e.g., SELinux, seccomp) that are outside CastaneaFS's control.
+
+### Information Leakage through Metadata
+
+Even without access to file contents, metadata can leak information:
+
+- The existence of a transaction itself may be sensitive.
+- Timing side-channels (e.g., observing lock contention delays) could reveal transaction activity.
+
+CastaneaFS's position: transaction existence metadata is visible to the system administrator (via the admin CLI utility). It is **not** visible to unprivileged processes that do not hold a token for the transaction. Timing side-channels are out of scope for the initial threat model.
+
+### Accidental Data Exposure through Permission Changes
+
+Addressed by the Security Conflict Policy (Rules 1–4). The conflict detection mechanism is the primary defense against this class of threat.
+
+### Scope Exclusions
+
+The following are explicitly out of scope for CastaneaFS's threat model:
+
+- Kernel or FUSE module compromise
+- Physical access attacks
+- Network-based attacks (tokens are local-only per constraint 4)
+- Side-channel attacks (timing, cache, power analysis)
+- Denial-of-service (resource exhaustion attacks on the transaction system are a liveness concern, not a confidentiality concern; addressed separately by transaction administration)
+- Application-level logic bugs (CastaneaFS protects filesystem-level invariants, not application semantics)
+
 ## Security Conflict Policy
 
 ### Motivation
@@ -248,3 +327,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-02-28**: Initial system design. Established two-token capability model, closed nested transaction model, failed transaction state semantics, POSIX-only permission model, CLI admin utility, and deferred persistence backend.
 - **2026-02-28**: Added Design Context (novelty analysis, ACID compositionality, nested transaction adoption) and References section (foundational literature, TLA+ specifications, testing tooling, industry practice, learning resources).
 - **2026-03-01**: Clarified snapshot timing (isolated at transaction creation), subtransaction token model (new token pair per subtransaction), transaction control interface (ioctl-based), permission check timing (at commit time), hierarchy root semantics, and security conflicts in commit rules.
+- **2026-03-02**: Added Threat Model section: trust boundaries, multi-mount architecture (primary mount with session-based access, transaction view mounts with OS-level access control), token leakage mitigations, metadata leakage position, and scope exclusions.
