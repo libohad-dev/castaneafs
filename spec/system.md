@@ -196,6 +196,27 @@ This creates a per-file access delegation mechanism. A CastaneaFS-aware wrapper 
 
 **Transactional semantics of delegated operations.** Operations on delegated FDs are still subject to the implicit subtransaction mechanism. The server wraps a write through a delegated FD in an implicit single-operation subtransaction within the transaction identified by the FD's file handle, and it goes through conflict detection as usual. Permission checks (commit rule 3) use the access mode established at `open()` time — the daemon does not re-check the caller's uid/gid on each read/write, consistent with Unix FD semantics where the access grant is bound to the file description, not the process.
 
+**`/proc` visibility and process execution.** When a process holds an FD to a file inside a transaction, the kernel exposes path information through `/proc` entries (`/proc/PID/fd/N`, `/proc/PID/cwd`, `/proc/PID/exe`, `/proc/PID/maps`). These entries are symlinks to paths on the FUSE mount. Another process reading through these paths triggers a new FUSE lookup with the *reading* process's identity — the reader sees its own view (committed state if it has no session), not the target process's transaction state. File *contents* are not leaked, but file *paths* are visible, which may reveal the existence of files created within the transaction.
+
+The `/proc/PID/fd/N` entries are kernel magic symlinks with special `open()` semantics: opening one creates a *new* file description via a new `FUSE_OPEN` with the opener's PID, rather than sharing the original file description. Only actual FD inheritance (`fork()`) or explicit FD passing (Unix socket `SCM_RIGHTS`) shares the original file description and its transaction context.
+
+**Executing transaction-state binaries.** When a session-bound process `fork()`s and the child calls `execve()` on a path inside the FUSE mount, the kernel opens the binary via `FUSE_OPEN` with the *child's* PID. The child has no session (sessions are non-transferable), so the daemon serves the **committed-state** version of the binary — not the transaction version, even if the parent modified the binary within the transaction. To execute the transaction version, the parent must use `fexecve()` (or equivalently, `execveat(fd, "", ..., AT_EMPTY_PATH)`), which uses the existing file description and its transaction-bound `fh`. After exec, the kernel demand-pages the binary through the file description established during exec; the `fh` is stable, so demand paging continues to serve the correct version.
+
+**Comparison of access patterns.** The three access patterns — session-based access on the primary mount, FD delegation, and transaction view mounts — differ in access scope, subprocess behavior, and security properties:
+
+| | Session-based (primary mount) | FD delegation | Transaction view mount |
+|---|---|---|---|
+| **Who sees transaction state** | Only the session-bound process | Any process holding the FD (via inheritance or passing) | All processes with POSIX access to the mount point |
+| **Access scope** | All paths on the mount | Per-file (or per-subtree, depending on directory FD design) | All paths on the mount |
+| **Subprocess `execve()` of transaction binary** | Child has no session; executes committed-state version unless `fexecve()` is used | Via `fexecve()` on the delegated FD: executes transaction version | Executes transaction version (mount serves it to everyone) |
+| **Subprocess path-based access** | Child sees committed state (no session) | Child without the FD sees committed state | Child sees transaction state |
+| **`/proc` content leakage** | Paths visible; contents not leaked (reader gets own view) | Paths visible; contents not leaked (magic symlink creates new file description) | Paths visible; contents accessible to anyone who can read the mount |
+| **Security model** | Token-based capability (per-process session) | Capability delegation (access grant bound to file description) | POSIX permissions (OS-level access control) |
+| **Tool compatibility** | CastaneaFS-aware tools only | Standard tools via `fexecve()`, process substitution, or piping | Standard tools work transparently |
+| **Revocation** | End the session | Close/do not pass the FD (but cannot revoke from a process that already holds it) | Unmount (affects all users of the mount) |
+
+The patterns form a spectrum from fine-grained-but-restrictive (session-based) to coarse-but-convenient (transaction view mount), with FD delegation as a middle ground that enables per-file access sharing with standard tools while preserving capability-based security semantics.
+
 **2. Transaction view mounts (fixed view, OS-level access control).** A user (or the admin tool) can request an additional mount point that exposes a single fixed transaction state to **all processes** that can access the mount point. Token presentation is required once, to create the mount. Access control is then handled by standard OS permissions on the mount point directory (ownership, mode bits) — the same mechanism that protects any private mount.
 
 ```
@@ -341,3 +362,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-01**: Clarified snapshot timing (isolated at transaction creation), subtransaction token model (new token pair per subtransaction), transaction control interface (ioctl-based), permission check timing (at commit time), hierarchy root semantics, and security conflicts in commit rules.
 - **2026-03-02**: Added Threat Model section: trust boundaries, multi-mount architecture (primary mount with session-based access, transaction view mounts with OS-level access control), token leakage mitigations, metadata leakage position, and scope exclusions.
 - **2026-03-02**: Added FD sharing semantics: file descriptor passing and inheritance, directory FD delegation and subtree access trade-offs, and transactional semantics of delegated operations. Clarified that implicit subtransaction wrapping is a server-side mechanism transparent to calling processes.
+- **2026-03-03**: Documented `/proc` visibility semantics, transaction-state binary execution behavior, and comparative analysis of the three access patterns (session-based, FD delegation, transaction view mount).
