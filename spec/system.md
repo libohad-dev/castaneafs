@@ -154,6 +154,7 @@ Filesystem operations within a transaction's scope are performed through standar
 > - POSIX advisory locks / flock
 > - File change notifications (inotify-style)
 > - Network-safe token transport
+> - Directory FD capability attenuation (ioctl to narrow subtree-capable directory FDs to listing-only before delegation)
 
 ## Threat Model
 
@@ -188,11 +189,11 @@ The choice will be made during feature design. The system-level requirement is: 
 
 This creates a per-file access delegation mechanism. A CastaneaFS-aware wrapper can selectively share access to specific transaction files with standard tools by opening files and passing FDs (e.g., via process substitution). This is not only a security concern but also a useful feature — it enables lightweight integration with non-CastaneaFS-aware tools without requiring a full transaction view mount.
 
-**Directory FD delegation and subtree access.** Whether a delegated directory FD provides access to the directory's children (and recursively, the entire subtree) is a feature-design decision with usability and security trade-offs:
+**Directory FD delegation and subtree access.** A delegated directory FD provides access to the directory's children and recursively the entire subtree. In FUSE, `openat(dirfd, "child")` resolves via `FUSE_LOOKUP(parent_inode, "child")`. If the parent inode belongs to a transaction namespace, the daemon resolves the child within the transaction — the inode graph carries the context. Recursive tools (e.g., `diff -r` via `/proc/self/fd/N/...`) work with delegated directory FDs.
 
-- In FUSE, `openat(dirfd, "child")` resolves via `FUSE_LOOKUP(parent_inode, "child")`. If the parent inode belongs to a transaction namespace, the daemon naturally resolves the child within the transaction — the inode graph carries the context. Under this model, directory FD delegation provides subtree access, and recursive tools (e.g., `diff -r` via `/proc/self/fd/N/...`) work with delegated directory FDs.
-- Alternatively, the daemon could require a session check on every lookup, limiting directory FD delegation to `readdir()` only (listing entries without opening them).
-- The trade-off is access granularity (per-file vs per-subtree) against usability for standard tool delegation. The choice will be made during feature design.
+This default is permissive: subtree access is granted on every directory FD opened within a transaction. The alternative — defaulting to restrictive (listing-only) and requiring an ioctl to unlock subtree traversal — would impose an extra call on every `opendir()` within a transaction, including the session-bound process's own internal use. Since the common case is a process using its own directory FDs (where subtree access is expected), the permissive default avoids this usability tax.
+
+> **Future feature**: A capability-attenuation ioctl that narrows a directory FD from subtree-capable to listing-only (`readdir()` without `openat()`) before delegating the FD to a subprocess. The narrowing would be irreversible on that file handle — the recipient cannot widen it back — providing per-delegation access granularity as a capability attenuation. The FUSE `open`/`opendir` path does not support custom per-open parameters (the `flags` field carries only standard POSIX open flags), so this attenuation must be a separate ioctl on the FD after open.
 
 **Transactional semantics of delegated operations.** Operations on delegated FDs are still subject to the implicit subtransaction mechanism. The server wraps a write through a delegated FD in an implicit single-operation subtransaction within the transaction identified by the FD's file handle, and it goes through conflict detection as usual. Permission checks (commit rule 3) use the access mode established at `open()` time — the daemon does not re-check the caller's uid/gid on each read/write, consistent with Unix FD semantics where the access grant is bound to the file description, not the process.
 
@@ -219,7 +220,7 @@ The `/proc/PID/fd/N` entries are kernel magic symlinks with special `open()` sem
 | | Session-based (primary mount) | FD delegation | Transaction view mount |
 |---|---|---|---|
 | **Who sees transaction state** | Only the session-bound process | Any process holding the FD (via inheritance or passing) | All processes with POSIX access to the mount point |
-| **Access scope** | All paths on the mount | Per-file (or per-subtree, depending on directory FD design) | All paths on the mount |
+| **Access scope** | All paths on the mount | Per-file or per-subtree (directory FDs grant subtree access by default) | All paths on the mount |
 | **Subprocess `execve()` of transaction binary** | Child has no session; executes committed-state version unless `fexecve()` is used | Via `fexecve()` on the delegated FD: executes transaction version | Executes transaction version (mount serves it to everyone) |
 | **Subprocess path-based access** | Child sees committed state (no session) | Child without the FD sees committed state | Child sees transaction state |
 | **`/proc` content leakage** | Paths visible; contents not leaked (reader gets own view) | Paths visible; contents not leaked (magic symlink creates new file description) | Paths visible; contents accessible to anyone who can read the mount |
@@ -374,4 +375,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-02**: Added FD sharing semantics: file descriptor passing and inheritance, directory FD delegation and subtree access trade-offs, and transactional semantics of delegated operations. Clarified that implicit subtransaction wrapping is a server-side mechanism transparent to calling processes.
 - **2026-03-03**: Documented `/proc` visibility semantics, transaction-state binary execution behavior, and comparative analysis of the three access patterns (session-based, FD delegation, transaction view mount).
 - **2026-03-03**: Documented FD lifecycle semantics: live shared view (not snapshot), unlink-while-open behavior, FD behavior across transaction state transitions (failed, aborted, committed), and access revocation policy — all FDs and sessions scoped to a transaction are invalidated when it reaches a terminal state, with no implicit promotion to the parent.
-- **2026-03-03**: Settled that empty file creation conflicts with ancestor permission relaxation — security conflict rules operate at the operation level, not content level; file presence alone carries information.
+- **2026-03-03**: Settled that empty file creation conflicts with ancestor permission relaxation — security conflict rules operate at the operation level, not content level; file presence alone carries information. Settled directory FD delegation scope: subtree access by default (permissive); capability-attenuation ioctl to narrow to listing-only deferred as a future feature.
