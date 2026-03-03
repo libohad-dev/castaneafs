@@ -293,7 +293,7 @@ The core observation is that application code has no general mechanism to detect
 
 **Rule 2: Content write + permission relaxation on an ancestor directory.** The conflict extends to the directory hierarchy. If transaction A creates or writes a file, and transaction B relaxes permissions on a directory anywhere in the file's ancestor chain, the transactions conflict. The new file or content could become inadvertently accessible through the newly-permissive directory, even though the file's own permission bits are restrictive.
 
-CastaneaFS does not inspect file content to determine sensitivity. It treats any combination of "file content changed" and "file access made more permissive" as a conflict, where "more permissive" is evaluated relative to the permission state at the start of the conflicting transaction's snapshot.
+CastaneaFS does not inspect file content to determine sensitivity. It operates at the level of file operations: any file creation or write — including the creation of an empty file — combined with permission relaxation constitutes a conflict. File presence alone can carry information (e.g., through the filename), so the conflict trigger is the operation itself, not whether content was written. "More permissive" is evaluated relative to the permission state at the start of the conflicting transaction's snapshot.
 
 **Rule 3: Uniform application across the transaction hierarchy.** Security conflict rules apply uniformly between all transactions — whether they are independent top-level transactions or sibling subtransactions of the same parent. CastaneaFS has no special rules distinguishing different levels of the transaction hierarchy. This falls out naturally from the general principle that all conflict detection uses the same mechanism regardless of nesting depth.
 
@@ -315,15 +315,13 @@ The following questions refine the boundaries of the security conflict detection
 
 3. **What constitutes "more permissive"?** Is any addition of permission bits sufficient (e.g., adding group-read to a file that was owner-only), or is the conflict limited to specific transitions (e.g., adding world-readable/writable)? How are setuid/setgid bit changes treated?
 
-4. **File creation vs. file write**: Rule 2 treats file creation as a content write. Should the creation of an empty file (no content written) also conflict with ancestor permission relaxation, or only files with content?
+4. **File deletion and permission relaxation**: If transaction A deletes a file and transaction B relaxes permissions on the directory, is that a conflict? The file no longer exists, so there is no content to expose — but the unlink operation itself reveals that a file existed at that path.
 
-5. **File deletion and permission relaxation**: If transaction A deletes a file and transaction B relaxes permissions on the directory, is that a conflict? The file no longer exists, so there is no content to expose — but the unlink operation itself reveals that a file existed at that path.
+5. **Symlinks**: Creating a symlink to a file in a more permissive directory could expose the target. Should symlink creation be treated as a permission-relevant operation on the target?
 
-6. **Symlinks**: Creating a symlink to a file in a more permissive directory could expose the target. Should symlink creation be treated as a permission-relevant operation on the target?
+6. **Permission restriction (tightening)**: If transaction A makes permissions *more restrictive* while transaction B writes content, is that a conflict? Tightening permissions doesn't expose data, but it could cause transaction B's subsequent operations to fail unexpectedly if they depend on the original permission state.
 
-7. **Permission restriction (tightening)**: If transaction A makes permissions *more restrictive* while transaction B writes content, is that a conflict? Tightening permissions doesn't expose data, but it could cause transaction B's subsequent operations to fail unexpectedly if they depend on the original permission state.
-
-8. **Root of the transaction hierarchy**: The filesystem itself serves as the root of the transaction hierarchy — the implicit parent into which top-level transactions commit. What state model applies to this root? Does it have a meaningful lifecycle (e.g., can it be "closed" during shutdown), how does it interact with crash recovery, and what are the semantics of committing a top-level transaction into it?
+7. **Root of the transaction hierarchy**: The filesystem itself serves as the root of the transaction hierarchy — the implicit parent into which top-level transactions commit. What state model applies to this root? Does it have a meaningful lifecycle (e.g., can it be "closed" during shutdown), how does it interact with crash recovery, and what are the semantics of committing a top-level transaction into it?
 
 Note: Rename/move across directories concurrent with content writes was considered as a potential security policy question but is already covered by standard write-write conflict detection (the move modifies the directory entry and file location, conflicting with concurrent writes to the file's content or its original parent directory).
 
@@ -376,3 +374,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-02**: Added FD sharing semantics: file descriptor passing and inheritance, directory FD delegation and subtree access trade-offs, and transactional semantics of delegated operations. Clarified that implicit subtransaction wrapping is a server-side mechanism transparent to calling processes.
 - **2026-03-03**: Documented `/proc` visibility semantics, transaction-state binary execution behavior, and comparative analysis of the three access patterns (session-based, FD delegation, transaction view mount).
 - **2026-03-03**: Documented FD lifecycle semantics: live shared view (not snapshot), unlink-while-open behavior, FD behavior across transaction state transitions (failed, aborted, committed), and access revocation policy — all FDs and sessions scoped to a transaction are invalidated when it reaches a terminal state, with no implicit promotion to the parent.
+- **2026-03-03**: Settled that empty file creation conflicts with ancestor permission relaxation — security conflict rules operate at the operation level, not content level; file presence alone carries information.
