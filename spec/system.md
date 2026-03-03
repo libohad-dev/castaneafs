@@ -38,17 +38,43 @@ This design yields several properties by construction:
 - **Intra-transaction visibility**: A participant sees another participant's writes only after the writing participant commits its subtransaction. Visibility is arbitrated by the timing relationship between one participant committing and another starting a new subtransaction.
 - **Write conflict handling**: Intra-transaction write conflicts are a special case of conflict between subtransactions, which are handled identically to conflicts between any transactions (see Failed State below).
 
-### Failed Transaction State
+### Transaction States
 
-When a transaction's commit fails (due to a conflict or other error), it enters a **failed** state with the following properties:
+A transaction (including subtransactions) is in exactly one of four states:
 
-- The transaction becomes **read-only**. No further writes are accepted.
-- **Commit cannot be retried**. The server rejects subsequent commit attempts immediately without performing expensive conflict checks.
-- **Subtransaction commits are rejected**. Committing a subtransaction into a failed parent marks the subtransaction as failed as well (cascading failure).
-- **Deeper nesting is unaffected**: A sub-subtransaction may still successfully commit into its (non-failed) parent subtransaction. For example, if transaction `T` is failed and `T.S1` is a subtransaction, committing `T.S1.S2` into `T.S1` may still succeed — but committing `T.S1` into `T` will fail and cascade `T.S1` into the failed state.
-- Committing into an **aborted** transaction also produces the failed state on the committing subtransaction.
-- The failed transaction's **filesystem content is persisted** and remains readable by access token holders. This allows participants to compare the failed state with the live committed state and retry application-level actions with full knowledge of what conflicted.
-- The owner token holder may **abort** a failed transaction, which triggers cleanup of the persisted filesystem content.
+- **Open**: Accepts reads, writes, and subtransaction commits. This is the only state in which a transaction can receive new work.
+- **Committed**: The transaction's changes have been merged into its parent's workspace (or, for a top-level transaction, into the filesystem). Terminal state.
+- **Aborted**: The transaction's changes have been discarded and its resources cleaned up. Terminal state. The owner token holder may abort any open or failed transaction.
+- **Failed**: The transaction is read-only. Its filesystem content is persisted and remains readable by access token holders, allowing them to compare the failed state with the live committed state and retry application-level actions. The owner token holder may abort a failed transaction to trigger cleanup.
+
+State transitions:
+
+```
+Open ──commit succeeds──► Committed
+Open ──commit fails─────► Failed
+Open ──abort────────────► Aborted
+Failed ─abort───────────► Aborted
+```
+
+No other transitions are possible. Committed and Aborted are terminal. Failed can only transition to Aborted (via the owner token holder).
+
+### Commit Rules and Failure
+
+A subtransaction's commit succeeds only if **all three** conditions hold:
+
+1. The parent transaction is **open**.
+2. The subtransaction's changes do not **conflict** with changes previously committed by a sibling subtransaction.
+3. The subtransaction's changes do not violate **POSIX permission checks** (e.g., writing to a read-only file, modifying a file owned by a different user).
+
+If any condition is violated, the committing subtransaction enters the **failed** state. This covers all failure cases uniformly:
+
+- Parent is **failed**, **aborted**, or **committed** — condition 1 violated.
+- Sibling write conflict — condition 2 violated.
+- Permission violation — condition 3 violated.
+
+**Implicit single-operation transactions and permission errors**: Every bare FUSE operation is wrapped in an implicit single-operation subtransaction (see Closed Nested Transaction Model above). When such an implicit subtransaction fails condition 3, the FUSE client simply aborts the subtransaction without persisting the failed state and returns the appropriate POSIX error code (e.g., `EACCES`, `EPERM`) to the calling process. This is indistinguishable from a standard POSIX permission error — no failed transaction state is visible to the user. In contrast, when an explicit subtransaction fails condition 3, the failed state is persisted as usual.
+
+Failure cascades only at commit boundaries: if `T` is failed and `T.S1` is a subtransaction of `T`, then committing `T.S1` into `T` will fail `T.S1`. But `T.S1` remains open until that commit is attempted, so `T.S1.S2` may still successfully commit into `T.S1` before `T.S1` itself attempts to commit.
 
 ### Transaction Administration
 
