@@ -193,6 +193,8 @@ The following questions refine the boundaries of the security conflict detection
 
 8. **Permission restriction (tightening)**: If transaction A makes permissions *more restrictive* while transaction B writes content, is that a conflict? Tightening permissions doesn't expose data, but it could cause transaction B's subsequent operations to fail unexpectedly if they depend on the original permission state.
 
+9. **Root of the transaction hierarchy**: The filesystem itself serves as the root of the transaction hierarchy — the implicit parent into which top-level transactions commit. What state model applies to this root? Does it have a meaningful lifecycle (e.g., can it be "closed" during shutdown), how does it interact with crash recovery, and what are the semantics of committing a top-level transaction into it?
+
 ## References
 
 ### Nested Transactions
