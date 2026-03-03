@@ -122,7 +122,7 @@ As a stop-gap measure, a **CLI administration utility** (`castaneafs-admin` or s
 
 5. **Server-side transaction state**: Transaction state (operation queues, isolation bookkeeping, conflict detection) is maintained on the server side. Clients are stateless with respect to transaction coordination; they submit operations and receive results, but do not hold authoritative transaction state.
 
-6. **Isolation from privilege escalation during concurrent policy changes**: The filesystem must guarantee that concurrent modifications to security policies (e.g., permission changes, ownership transfers) cannot create transient windows where file content becomes accessible to unprivileged processes. Policy changes and data access must be ordered such that security invariants hold at every observable state.
+6. **Security-oriented conflict detection**: The filesystem's conflict detection extends beyond data-level conflicts to include security-relevant interactions between concurrent transactions. See the Security Conflict Policy section below for the full treatment.
 
 7. **Serializable transaction isolation**: Concurrent transactions must produce outcomes equivalent to some serial execution order. The system may employ snapshot isolation, two-phase locking, or serializable snapshot isolation internally, but the externally observable behavior must be serializable.
 
@@ -146,6 +146,52 @@ As a stop-gap measure, a **CLI administration utility** (`castaneafs-admin` or s
 > - POSIX advisory locks / flock
 > - File change notifications (inotify-style)
 > - Network-safe token transport
+
+## Security Conflict Policy
+
+### Motivation
+
+Standard transactional conflict detection operates at the data level: two transactions conflict when they access the same data and at least one is a write. CastaneaFS extends this with **security-oriented conflict detection** that treats certain combinations of concurrent operations as conflicts even when they do not touch the same data, because the combination could result in unintended information exposure.
+
+The core observation is that application code has no general mechanism to detect or prevent security violations arising from concurrent permission changes. By the time a process learns that file permissions have changed, the data it wrote under the old permission assumptions may already be exposed. CastaneaFS addresses this by treating the conflict as a transaction-level concern: the filesystem does not attempt to understand whether written content is genuinely sensitive, but conservatively treats the combination of content modification and permission relaxation as a conflict.
+
+### Established Rules
+
+**Rule 1: Content write + permission relaxation on the same file.** If transaction A writes to a file and transaction B makes that file's permissions more permissive (e.g., adding world-readable bits), the two transactions conflict. Transaction A may have written data under the assumption that only the file's current permission set governs access; transaction B's change would retroactively violate that assumption upon commit.
+
+**Rule 2: Content write + permission relaxation on an ancestor directory.** The conflict extends to the directory hierarchy. If transaction A creates or writes a file, and transaction B relaxes permissions on a directory anywhere in the file's ancestor chain, the transactions conflict. The new file or content could become inadvertently accessible through the newly-permissive directory, even though the file's own permission bits are restrictive.
+
+CastaneaFS does not inspect file content to determine sensitivity. It treats any combination of "file content changed" and "file access made more permissive" as a conflict, where "more permissive" is evaluated relative to the permission state at the start of the conflicting transaction's snapshot.
+
+**Rule 3: Uniform application across the transaction hierarchy.** Security conflict rules apply uniformly between all transactions — whether they are independent top-level transactions or sibling subtransactions of the same parent. CastaneaFS has no special rules distinguishing different levels of the transaction hierarchy. This falls out naturally from the general principle that all conflict detection uses the same mechanism regardless of nesting depth.
+
+**Rule 4: Root exemption from security conflict checks.** The root user (uid 0) is exempt from security conflict checks, consistent with the POSIX convention that root is exempt from permission checks but bound by structural constraints. The reasoning is as follows:
+
+- CastaneaFS's conflict detection addresses three categories of concern: *structural integrity* (e.g., creating a file in a deleted directory), *permission violations* (e.g., writing to a read-only file), and *security policy violations* (the rules above).
+- In POSIX, structural constraints are impossible to violate (the operation has no meaning), while permission restrictions are merely access controls that root may bypass. Security policy violations — like permission violations — still leave the filesystem in a structurally valid state, so root is permitted to bypass them.
+- For shared transactions, the effective user for security conflict checks is the user who issues the commit with the owner token. If root holds the owner token and commits, security conflict checks are skipped for that commit.
+
+> **Warning — shared transactions with root**: Because root bypasses security conflict checks, sharing a transaction's access token with root-owned processes means those processes' modifications will not be security-checked at commit time. Users who are concerned about unintended data exposure should avoid sharing transactions with root-owned processes, or isolate root operations inside dedicated subtransactions whose results can be inspected before committing to the parent. This mirrors general security practice: limit root-level operations within user-owned activities.
+
+### Open Questions
+
+The following questions refine the boundaries of the security conflict detection rules. Answers will be incorporated as the policy is finalized during feature design.
+
+1. **Does the reverse direction conflict?** If transaction A *reads* a file and transaction B relaxes that file's permissions, is that a conflict? The read itself does not change content, but the reader may have made decisions based on the assumption that the file was restricted.
+
+2. **Ownership changes (chown)**: Are ownership transfers treated equivalently to permission bit changes? Changing a file's owner or group can effectively widen access if the new owner/group has broader membership. Should `chown` always be treated as a permission relaxation, or only when the new owner/group demonstrably broadens access?
+
+3. **What constitutes "more permissive"?** Is any addition of permission bits sufficient (e.g., adding group-read to a file that was owner-only), or is the conflict limited to specific transitions (e.g., adding world-readable/writable)? How are setuid/setgid bit changes treated?
+
+4. **File creation vs. file write**: Rule 2 treats file creation as a content write. Should the creation of an empty file (no content written) also conflict with ancestor permission relaxation, or only files with content?
+
+5. **File deletion and permission relaxation**: If transaction A deletes a file and transaction B relaxes permissions on the directory, is that a conflict? The file no longer exists, so there is no content to expose — but the unlink operation itself reveals that a file existed at that path.
+
+6. **Rename / move across directories**: If a file is renamed or moved into a directory with more permissive access, does that count as a permission relaxation on the file? Does moving a file *out of* a permissive directory and into a restrictive one interact with concurrent content writes?
+
+7. **Symlinks**: Creating a symlink to a file in a more permissive directory could expose the target. Should symlink creation be treated as a permission-relevant operation on the target?
+
+8. **Permission restriction (tightening)**: If transaction A makes permissions *more restrictive* while transaction B writes content, is that a conflict? Tightening permissions doesn't expose data, but it could cause transaction B's subsequent operations to fail unexpectedly if they depend on the original permission state.
 
 ## References
 
