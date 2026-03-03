@@ -76,7 +76,7 @@ If any condition is violated, the committing subtransaction enters the **failed*
 
 **Implicit single-operation transactions and permission errors**: The server wraps every bare FUSE operation in an implicit single-operation subtransaction (see Closed Nested Transaction Model above). When such an implicit subtransaction fails condition 3, the server simply aborts the subtransaction without persisting the failed state and returns the appropriate POSIX error code (e.g., `EACCES`, `EPERM`) to the calling process. This is indistinguishable from a standard POSIX permission error — no failed transaction state is visible to the user. In contrast, when an explicit subtransaction fails condition 3, the failed state is persisted as usual.
 
-Failure cascades only at commit boundaries: if `T` is failed and `T.S1` is a subtransaction of `T`, then committing `T.S1` into `T` will fail `T.S1`. But `T.S1` remains open until that commit is attempted, so `T.S1.S2` may still successfully commit into `T.S1` before `T.S1` itself attempts to commit.
+Failure cascades only at commit boundaries: if `T` is failed and `T.S1` is a subtransaction of `T`, then committing `T.S1` into `T` will fail `T.S1`. But `T.S1` remains open until that commit is attempted, so `T.S1.S2` may still successfully commit into `T.S1` before `T.S1` itself attempts to commit. This is by design: subtransactions of a failed parent remain live, supporting use cases where the transaction serves as an experimentation sandbox with no intention of eventually committing (e.g., testing configurations, comparing alternatives). There is no mechanism to notify subtransaction participants of a parent's failure other than the failure they observe when they attempt to commit — the system does not proactively cascade failure or revoke access to open subtransactions.
 
 ### Transaction Administration
 
@@ -155,6 +155,9 @@ Filesystem operations within a transaction's scope are performed through standar
 > - File change notifications (inotify-style)
 > - Network-safe token transport
 > - Directory FD capability attenuation (ioctl to narrow subtree-capable directory FDs to listing-only before delegation)
+> - Preemptive cascading cleanup (aborting a transaction forcibly aborts all its open descendant subtransactions)
+>
+> **Implementation note**: Implementations may impose a maximum nesting depth for subtransactions as a resource management measure. This is not a design-level constraint — the abstract model permits unbounded nesting.
 
 ## Threat Model
 
@@ -324,7 +327,9 @@ The following questions refine the boundaries of the security conflict detection
 
 7. **Root of the transaction hierarchy**: The filesystem itself serves as the root of the transaction hierarchy — the implicit parent into which top-level transactions commit. What state model applies to this root? Does it have a meaningful lifecycle (e.g., can it be "closed" during shutdown), how does it interact with crash recovery, and what are the semantics of committing a top-level transaction into it?
 
-Note: Rename/move across directories concurrent with content writes was considered as a potential security policy question but is already covered by standard write-write conflict detection (the move modifies the directory entry and file location, conflicting with concurrent writes to the file's content or its original parent directory).
+8. **Subtransaction creation from a failed transaction**: Can new subtransactions be opened within a failed transaction? The failed state is defined as read-only ("cannot receive new work"), but subtransaction creation could be considered an administrative operation rather than new work — the subtransaction would snapshot the failed state and provide a workspace for experimentation or retry logic. Permitting it supports the sandbox use case; prohibiting it simplifies the state model.
+
+Note: Rename/move across directories concurrent with content writes was considered as a potential security policy question but is already covered by standard write-write conflict detection. Under CastaneaFS's transactional model, rename is equivalent to an atomic delete at the source path and create at the destination path. This equivalence, which is only approximate in conventional filesystems, is made precise by CastaneaFS's atomicity guarantees. A concurrent content write to the file at the source path conflicts with the delete component (both modify the same path's directory entry), so the rename and write cannot both commit — no additional security-specific rule is needed.
 
 ## References
 
@@ -377,3 +382,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-03**: Documented FD lifecycle semantics: live shared view (not snapshot), unlink-while-open behavior, FD behavior across transaction state transitions (failed, aborted, committed), and access revocation policy — all FDs and sessions scoped to a transaction are invalidated when it reaches a terminal state, with no implicit promotion to the parent.
 - **2026-03-03**: Settled that empty file creation conflicts with ancestor permission relaxation — security conflict rules operate at the operation level, not content level; file presence alone carries information. Settled directory FD delegation scope: subtree access by default (permissive); capability-attenuation ioctl to narrow to listing-only deferred as a future feature.
 - **2026-03-03**: Revised isolation level from serializability to snapshot isolation with security extensions — write skew is permitted, consistent with no application-level invariant enforcement. Clarified that conflict detection is optimistic (commit-time). Clarified that the committing user's identity (owner token holder) governs all commit-time checks, not just security conflict checks.
+- **2026-03-03**: Documented that subtransactions of a failed parent remain live by design (sandbox use case). Added preemptive cascading cleanup as a future feature; nesting depth limits noted as an implementation detail. Added open question on subtransaction creation from failed state. Clarified rename conflict analysis: rename is equivalent to atomic delete+create under CastaneaFS's atomicity, making concurrent write conflicts explicit without additional security rules.
