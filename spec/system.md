@@ -165,6 +165,7 @@ Filesystem operations within a transaction's scope are performed through standar
 > - Network-safe token transport
 > - Directory FD capability attenuation (ioctl to narrow subtree-capable directory FDs to listing-only before delegation)
 > - Preemptive cascading cleanup (aborting a transaction forcibly aborts all its open descendant subtransactions)
+> - Read-only transaction view mounts (mount a transaction's state as a read-only filesystem, preventing writes through the mount regardless of POSIX permissions)
 > - Automatic unmount of inert transaction view mounts (detecting when no process references the mount and unmounting without manual intervention)
 >
 > **Implementation note**: Implementations may impose a maximum nesting depth for subtransactions as a resource management measure. This is not a design-level constraint — the abstract model permits unbounded nesting.
