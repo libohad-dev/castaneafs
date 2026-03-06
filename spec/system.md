@@ -93,7 +93,7 @@ There are no system-imposed limits on the number of open or failed transactions.
 
 > **Future feature**: Configurable limits on transaction count, lifetime, and disk usage are noted for potential future inclusion.
 
-As a stop-gap measure, a **CLI administration utility** (`castaneafs-admin` or similar) will be implemented that allows admin-privileged users to:
+As a stop-gap measure, the **`castaneafs` CLI tool** will provide administration commands that allow admin-privileged users to:
 
 - List existing open and failed transactions with relevant metadata (disk usage, time of transaction start or failure, owner PID, etc.).
 - Force cleanup of open or failed transactions.
@@ -104,7 +104,7 @@ As a stop-gap measure, a **CLI administration utility** (`castaneafs-admin` or s
 - **Client processes**: User-space programs that interact with the filesystem through standard POSIX syscalls and through a transaction control interface (for creating, joining, committing, and aborting transactions).
 - **Transaction owner**: The process (or its delegates) holding the owner token for a transaction. Controls the transaction's lifecycle (commit/abort).
 - **Transaction participants**: Processes holding an access token for a transaction. Can perform filesystem operations within the transaction's scope, subject to POSIX permission checks. May create subtransactions.
-- **System administrator**: Privileged user who can inspect and force-cleanup transactions via the CLI administration utility.
+- **System administrator**: Privileged user who can inspect and force-cleanup transactions via the `castaneafs` CLI tool.
 
 ### Transaction Control Interface
 
@@ -115,7 +115,7 @@ Filesystem operations within a transaction's scope are performed through standar
 ### Technology Stack
 
 - **Formal specification**: TLA+ (with potential TLAPS-powered proofs of formal properties) for modeling the filesystem, transaction mechanism, and security policies.
-- **Implementation language**: F* (F-star), a proof-oriented programming language, for the server and reference client.
+- **Implementation language**: F* (F-star), a proof-oriented programming language, for the server and the `castaneafs` CLI administration tool.
 - **Integration testing**: Go with testcontainers for isolated behavioral tests and benchmarks, including demonstrations of security properties under concurrent multi-user scenarios (varying privilege levels, including root).
 
 ### Design Context
@@ -259,7 +259,7 @@ This default is permissive: subtree access is granted on every directory FD open
 
 **Access scope across transaction state transitions.** The FD staleness rule above is an instance of a general principle that applies equally to all access patterns — session-based, FD delegation, and transaction view mounts: when a transaction reaches a terminal state (committed, aborted, or failed→aborted), all access privileges scoped to that transaction are revoked. Subtransaction tokens are scoped to the subtransaction (see Closed Nested Transaction Model: "Creating a subtransaction issues a new pair of owner and access tokens for the subtransaction, scoped to it"), so when the subtransaction reaches a terminal state, those tokens reference a closed transaction. Participants are not implicitly granted access to the parent — their sessions become invalid and they must independently present a parent token to continue working. This preserves a clean security boundary: access is always explicitly granted, never silently inherited from a completed transaction.
 
-**Transaction view mount behavior after transaction termination.** Transaction view mounts follow the same access revocation principle. When the underlying transaction reaches a terminal state, the mount becomes inert: all operations return `ESTALE`. The mount remains mounted — auto-unmount is not possible because a FUSE unmount fails with `EBUSY` if any process has open FDs or a working directory inside the mount, and the daemon cannot guarantee this. The inert mount must be manually unmounted by the user or the system administrator (via `fusermount -u` or the admin CLI utility).
+**Transaction view mount behavior after transaction termination.** Transaction view mounts follow the same access revocation principle. When the underlying transaction reaches a terminal state, the mount becomes inert: all operations return `ESTALE`. The mount remains mounted — auto-unmount is not possible because a FUSE unmount fails with `EBUSY` if any process has open FDs or a working directory inside the mount, and the daemon cannot guarantee this. The inert mount must be manually unmounted by the user or the system administrator (via `fusermount -u` or the `castaneafs` CLI tool).
 
 **`/proc` visibility and process execution.** When a process holds an FD to a file inside a transaction, the kernel exposes path information through `/proc` entries (`/proc/PID/fd/N`, `/proc/PID/cwd`, `/proc/PID/exe`, `/proc/PID/maps`). These entries are symlinks to paths on the FUSE mount. Another process reading through these paths triggers a new FUSE lookup with the *reading* process's identity — the reader sees its own view (committed state if it has no session), not the target process's transaction state. File *contents* are not leaked, but file *paths* are visible, which may reveal the existence of files created within the transaction.
 
@@ -282,7 +282,7 @@ The `/proc/PID/fd/N` entries are kernel magic symlinks with special `open()` sem
 
 The patterns form a spectrum from fine-grained-but-restrictive (session-based) to coarse-but-convenient (transaction view mount), with FD delegation as a middle ground that enables per-file access sharing with standard tools while preserving capability-based security semantics.
 
-**2. Transaction view mounts (fixed view, OS-level access control).** A user (or the admin tool) can request an additional mount point that exposes a single fixed transaction state to **all processes** that can access the mount point. Token presentation is required once, to create the mount. Access control is then handled by standard OS permissions on the mount point directory (ownership, mode bits) — the same mechanism that protects any private mount.
+**2. Transaction view mounts (fixed view, OS-level access control).** A user (or the `castaneafs` CLI tool) can request an additional mount point that exposes a single fixed transaction state to **all processes** that can access the mount point. Token presentation is required once, to create the mount. Access control is then handled by standard OS permissions on the mount point directory (ownership, mode bits) — the same mechanism that protects any private mount.
 
 ```
 castaneafs mount --transaction <token> /mnt/castanea-txn123
@@ -315,7 +315,7 @@ Even without access to file contents, metadata can leak information:
 - The existence of a transaction itself may be sensitive.
 - Timing side-channels (e.g., observing lock contention delays) could reveal transaction activity.
 
-CastaneaFS's position: transaction existence metadata is visible to the system administrator (via the admin CLI utility). It is **not** visible to unprivileged processes that do not hold a token for the transaction. Timing side-channels are out of scope for the initial threat model.
+CastaneaFS's position: transaction existence metadata is visible to the system administrator (via the `castaneafs` CLI tool). It is **not** visible to unprivileged processes that do not hold a token for the transaction. Timing side-channels are out of scope for the initial threat model.
 
 ### Accidental Data Exposure through Permission Changes
 
@@ -485,3 +485,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-05**: Introduced conflict domains separating content (file data, directory entries) from permission metadata (chmod, chown/chgrp) on the same inode. Content and permission changes no longer produce standard write-write conflicts with each other; cross-domain interactions are mediated by security conflict rules (Rules 1–3) and POSIX permission checks (commit rule 3). Added permission metadata reconciliation: concurrent pure-expansion permission bit changes merge via bitwise OR; convergent ownership changes do not conflict; any restriction or divergent ownership uses first-committer-wins. Revised the security reference state for "more permissive" evaluation: the reference is uniformly the writing transaction's final permission state for the object (a transaction that does not modify permissions has a final state equal to its snapshot start, so no case split is needed). Rule 3 (ownership) uses the same principle — convergent final ownership produces no conflict. Added pairwise sufficiency argument for merged permission expansions. Added reconciliation examples to Non-conflicts section.
 - **2026-03-06**: Reframed conflict detection from pairwise sibling comparisons to current-state comparison: all domain checks (content, permission bits, ownership, security rules) compare the committing transaction's state against the parent's current committed state, which encapsulates all intermediate sibling commits regardless of their start times. This follows the pattern used by optimistic concurrency control systems generally (FoundationDB, CockroachDB, PostgreSQL SI). Documented that the permission bit reconciliation is structurally a state-based CRDT — the merge function (bitwise OR) is commutative, associative, idempotent, and monotone over the subset lattice, guaranteeing order-independent convergence and composable security checks. Replaced the pairwise sufficiency argument with a direct current-state security comparison. Added scenario verification table (11 cases) exercising the interaction of metadata reconciliation, security conflict rules, and POSIX permission checks, with worked metadata check derivations using the S/E/P model.
 - **2026-03-07**: Added directory permission semantics for Rules 1–2: both `r` (listing) and `x` (traversal) bits are independently security-relevant for directories; `w` is not (integrity concern). Documented that current ancestor-chain analysis is conservative (any single relaxation triggers conflict) with a future refinement for minimum-effective-access analysis across the chain.
+- **2026-03-07**: Renamed CLI tool from `castaneafs-admin` to `castaneafs`, following the naming convention of `btrfs` and `zfs`. Replaced "reference client" mention with explicit reference to the `castaneafs` CLI administration tool — there is no client library; CastaneaFS is accessed via standard POSIX syscalls and ioctls.
