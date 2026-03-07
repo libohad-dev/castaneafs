@@ -177,7 +177,7 @@ All three checks are independent. A commit fails if any check fails.
 
 12. **Failed transactions are preserved**: A failed transaction's content persists in a read-only state until explicitly aborted by the owner. This enables application-level inspection and retry without requiring the server to support automatic conflict resolution or merge semantics.
 
-13. **POSIX permission model only (initially)**: Access control uses standard POSIX uid/gid/mode bits. No ACLs, mandatory access control, or extended attributes in the initial implementation.
+13. **POSIX permission model only (initially)**: Access control uses standard POSIX uid/gid/mode bits. No ACLs, mandatory access control, or extended attributes in the initial implementation. See POSIX Surface for the xattr and ACL error code strategy and storage considerations.
 
 > **Future features noted for potential inclusion**:
 > - Fine-grained token permissions (subtree-scoped, read-only, operation-type restrictions)
@@ -242,13 +242,29 @@ FIFOs, device nodes, and sockets are deferred to future versions. `mknod()` and 
 - `STATX_MNT_ID`: Filled by the kernel, not CastaneaFS.
 - Other `STATX_*` fields (e.g., `STATX_DIOALIGN`, `STATX_SUBVOL`): Not supported; corresponding mask bits are unset in the response.
 
-`stx_attributes_mask` is zero (no file attributes — compressed, immutable, append-only, etc. — are supported in the initial implementation).
+`stx_attributes` is reserved per-inode to avoid on-disk format changes when file attribute support is added. The stored value is always zero in the initial implementation. `stx_attributes_mask` is reported as zero, so callers know that the `stx_attributes` field carries no usable meaning. Both fields are 64 bits wide (`__u64`), matching the kernel definition in `<linux/stat.h>`.
 
-> **Future feature**: File attributes (immutable, append-only) via `stx_attributes` and `FS_IOC_SETFLAGS`/`FS_IOC_GETFLAGS` ioctls are noted for potential future inclusion.
+The `stx_attributes` flags correspond numerically to the `FS_*_FL` inode flags in the lower 32 bits (e.g., `STATX_ATTR_IMMUTABLE` = `FS_IMMUTABLE_FL` = `0x10`). When file attribute support is added, the per-inode storage uses the 64-bit `stx_attributes` representation as the canonical format; `FS_IOC_GETFLAGS` will present the low 32 bits.
+
+> **Future feature**: File attributes (immutable, append-only, nodump) via `stx_attributes` and `FS_IOC_SETFLAGS`/`FS_IOC_GETFLAGS` ioctls are noted for potential future inclusion. When supported, `stx_attributes_mask` will be updated to reflect the supported attribute bits.
 
 **Timestamp resolution.** All timestamps (mtime, ctime, btime) are stored with nanosecond resolution (`struct timespec` / `struct statx_timestamp`).
 
 **Timestamp conflict semantics.** Timestamps are not a conflict domain — they are side effects of content and metadata operations, not independent writes. Concurrent updates to the same inode's timestamps are merged via `max(parent_current, transaction_end)`. See Conflict Domains: Other inode metadata for the full merge semantics.
+
+**Extended attributes.** All four xattr operations (`getxattr`, `setxattr`, `listxattr`, `removexattr`) return `ENOTSUP` (`EOPNOTSUPP`) in the initial implementation. The FUSE kernel module caches `ENOSYS` per-connection for each xattr opcode and stops forwarding subsequent calls to userspace — `ENOTSUP` avoids this caching behavior, allowing xattr support to be enabled at runtime without remounting. `ENOTSUP` is also the standard error documented in `getxattr(2)` for filesystems that do not support extended attributes.
+
+When xattr support is added, the on-disk storage mechanism must be the same across all server implementations to maintain cross-implementation compatibility. Three patterns from existing filesystems define the design space:
+
+1. **Inline + single overflow block** (ext4, ZFS). Xattr data is inlined in the inode up to a size limit (~100–264 bytes). Overflow is handled via a pointer field in the inode to a single external block. ext4 uses `i_file_acl`; ZFS uses a spill block. ext4's `EA_INODE` feature extends this for values up to 1 MiB.
+
+2. **Inline + B-tree** (XFS). Three tiers: shortform (inline in the inode attribute fork), leaf blocks, and full B-tree. The inode's `di_forkoff` field divides inode space between data and attribute forks. Scales to large numbers of xattrs.
+
+3. **External tree items only** (btrfs). No inline storage. Xattrs are items in the global B+tree keyed by (inode number, name hash). Simplest inode structure (no xattr fields needed) but requires a tree lookup for every xattr access.
+
+All four filesystems use length-prefixed entries (not null-terminated) for xattr storage. Each entry has a fixed header with name length, value length, and namespace index, followed by name bytes and value bytes. Entries are typically 4-byte aligned. The specific storage mechanism will be chosen during feature design; the choice is deferred because xattr data is variable-length and cannot be reserved as a fixed per-inode field.
+
+**POSIX ACLs.** On Linux, POSIX ACLs are stored as extended attributes in the `system.posix_acl_access` and `system.posix_acl_default` namespaces — this is universal across ext4, btrfs, XFS, and ZFS; no filesystem has a dedicated ACL on-disk structure. ACL support therefore requires no separate per-inode field; it is a policy layer on top of xattr storage. When ACLs are added, the permission metadata conflict domain will need to account for ACL entries — the bitwise-OR CRDT reconciliation described in Conflict Domains is specific to the fixed-width mode bitmask and does not extend to ACL structures (ordered lists of access control entries).
 
 ### Link Types: Design Rationale
 
@@ -543,3 +559,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-07**: Added directory permission semantics for Rules 1–2: both `r` (listing) and `x` (traversal) bits are independently security-relevant for directories; `w` is not (integrity concern). Documented that current ancestor-chain analysis is conservative (any single relaxation triggers conflict) with a future refinement for minimum-effective-access analysis across the chain.
 - **2026-03-07**: Renamed CLI tool from `castaneafs-admin` to `castaneafs`, following the naming convention of `btrfs` and `zfs`. Replaced "reference client" mention with explicit reference to the `castaneafs` CLI administration tool — there is no client library; CastaneaFS is accessed via standard POSIX syscalls and ioctls.
 - **2026-03-07**: Added POSIX Surface section: supported file types (regular files, directories, symlinks; FIFOs, device nodes, sockets deferred with `EPERM`), file type conflict semantics (convergent type required at same path, otherwise first-committer-wins), inode metadata fields (`struct stat` mapping, synthetic atime as ctime, birth time, `st_rdev` reserved per-inode for future device support), `stat`/`statx` behavior (`stx_mask` advertisement, `STATX_BTIME` support), timestamp resolution (nanosecond), and timestamp conflict semantics (`max` merge). Updated constraint 10 to reference the new section. Added timestamp merge rule (`max(parent_current, transaction_end)`) to the Conflict Domains "Other inode metadata" paragraph. Added FIFOs/device nodes/sockets and `stx_attributes` to future features.
+- **2026-03-07**: Reserved `stx_attributes` per-inode (64-bit, always zero) to avoid on-disk format changes when file attribute support is added; documented `FS_*_FL` correspondence. Added xattr error code strategy (`ENOTSUP` to avoid FUSE `ENOSYS` per-connection caching), xattr storage design space (three patterns: inline+overflow, inline+B-tree, external tree items), and length-prefixed entry format. Added POSIX ACL documentation: stored as xattrs in `system.posix_acl_access`/`system.posix_acl_default` (universal across ext4, btrfs, XFS, ZFS), no dedicated per-inode field needed, conflict domain forward reference (bitwise-OR CRDT does not extend to ACL structures). Updated constraint 13 to cross-reference POSIX Surface xattr/ACL coverage.
