@@ -141,7 +141,7 @@ CastaneaFS partitions the modifications a transaction can make to a single inode
 
 The permission bit reconciliation is structurally a **state-based CRDT** (conflict-free replicated data type): the merge function (bitwise OR) is commutative, associative, idempotent, and monotone over the subset lattice of permission bits. These algebraic properties guarantee that the merged result is independent of the order in which transactions commit — two pure expansions produce the same merged state regardless of commit sequence. The monotonicity of OR over the subset relation is also what makes the security checks composable: if the current parent state does not exceed the writer's security reference, no future pure-expansion merge can cause it to do so, because OR can only add bits, and each merge is checked at its own commit time. This current-state comparison approach — validating the committing transaction against the parent's committed state rather than enumerating individual concurrent transactions — follows the same pattern used by optimistic concurrency control systems generally: FoundationDB's Resolver checks a transaction's read set against a unified map of recent committed writes; CockroachDB's read-refresh validates against the MVCC version history in a timestamp range; PostgreSQL's snapshot isolation checks a tuple's `xmax` against the transaction's snapshot. In all cases, the current state subsumes the chain of intermediate commits. CastaneaFS's contribution is applying reconciliation (not just abort) within this model, using the algebraic properties of the merge operation to guarantee that the reconciled result is safe without requiring knowledge of the individual transactions that produced the current state.
 
-**Other inode metadata.** Timestamps and file size are side effects of content-domain operations and do not form an independent conflict domain. Link count changes are directory-entry operations in the content domain.
+**Other inode metadata.** Timestamps (mtime, ctime) are side effects of content-domain operations and do not form an independent conflict domain. Concurrent updates to the same inode's timestamps are merged as `max(parent_current, transaction_end)` — the most recent timestamp always wins. This merge is commutative and idempotent (max over a total order), so timestamp values never produce conflicts regardless of commit order. File size is a side effect of content-domain operations (writes, truncates) and is determined by the content that wins the content-domain conflict check. Link count changes are directory-entry operations in the content domain.
 
 **Cross-domain interactions.** Content writes and permission metadata changes on the same inode do **not** produce a standard write-write conflict (they are in different domains). Instead, three independent checks mediate their interaction:
 
@@ -171,7 +171,7 @@ All three checks are independent. A commit fails if any check fails.
 
 9. **Transaction liveness**: Every transaction must eventually either commit or abort. The system must prevent indefinite transaction stalls through timeout-based expiration, deadlock detection, or a combination of both. Orphaned tokens (from crashed processes) must not hold resources indefinitely.
 
-10. **POSIX compliance (modulo stated omissions)**: All standard filesystem operations (open, read, write, close, mkdir, rmdir, rename, chmod, chown, stat, readdir, truncate, symlink, readlink, unlink, etc.) must behave according to POSIX semantics except where explicitly stated otherwise (hardlinks, atime).
+10. **POSIX compliance (modulo stated omissions)**: All standard filesystem operations (open, read, write, close, mkdir, rmdir, rename, chmod, chown, stat, readdir, truncate, symlink, readlink, unlink, etc.) must behave according to POSIX semantics except where explicitly stated otherwise. See POSIX Surface for the full list of supported file types, inode metadata fields, and omissions.
 
 11. **Closed nested transactions**: All filesystem operations — whether explicit transactions or bare FUSE operations — pass through the same transactional conflict detection mechanism. Bare operations are implicitly wrapped in single-operation subtransactions. This provides a uniform concurrency model with no special cases.
 
@@ -191,8 +191,64 @@ All three checks are independent. A commit fails if any check fails.
 > - Preemptive cascading cleanup (aborting a transaction forcibly aborts all its open descendant subtransactions)
 > - Read-only transaction view mounts (mount a transaction's state as a read-only filesystem, preventing writes through the mount regardless of POSIX permissions)
 > - Automatic unmount of inert transaction view mounts (detecting when no process references the mount and unmounting without manual intervention)
+> - FIFOs, device nodes, and Unix domain sockets (`mknod`, `mkfifo`)
+> - File attributes (`stx_attributes`: immutable, append-only) via `statx` and `FS_IOC_*` ioctls
 >
 > **Implementation note**: Implementations may impose a maximum nesting depth for subtransactions as a resource management measure. This is not a design-level constraint — the abstract model permits unbounded nesting.
+
+### POSIX Surface
+
+**File types.** POSIX defines seven file types. CastaneaFS supports three:
+
+| Type | Constant | Supported | Notes |
+|---|---|---|---|
+| Regular file | `S_IFREG` | Yes | |
+| Directory | `S_IFDIR` | Yes | |
+| Symbolic link | `S_IFLNK` | Yes | See Link Types |
+| FIFO | `S_IFIFO` | No | Deferred |
+| Block device | `S_IFBLK` | No | Deferred |
+| Character device | `S_IFCHR` | No | Deferred |
+| Unix domain socket | `S_IFSOCK` | No | Deferred |
+
+FIFOs, device nodes, and sockets are deferred to future versions. `mknod()` and `mkfifo()` return `EPERM` for unsupported types. The choice of error code is deliberate: `ENOSYS` ("function not implemented") risks FUSE interpreting it as permanently unimplemented and caching the rejection — the kernel may stop forwarding `mknod` requests entirely, which would break if support is added later (e.g., via a server upgrade without remount). `EOPNOTSUPP` ("operation not supported") is semantically precise but not conventionally used for file type restrictions. `EPERM` ("operation not permitted") is the standard return for `mknod` when the caller lacks the right to create the requested file type, and is what most FUSE filesystems use in this situation. The inode structure reserves the file type bits in `st_mode` (and `st_rdev` — see Inode metadata) so no on-disk format change is needed when support is added.
+
+**File type conflict semantics.** File type is a conflict domain for directory entry creation: when two concurrent transactions create an entry at the same path, they must agree on the file type. If both create the same type (e.g., both create a regular file), the file type is convergent and does not produce a conflict on its own — content-domain conflict rules still apply to the entry's data. If they create different types (e.g., one creates a regular file and another creates a directory), first-committer-wins applies. This is consistent with conventional filesystem behavior, where overwriting a directory with a regular file (or vice versa) is not permitted.
+
+**Inode metadata.** Each inode stores the following metadata fields, which correspond to the POSIX `struct stat` fields:
+
+| Field | Stored | Notes |
+|---|---|---|
+| `st_ino` | Yes | Server-assigned inode number, unique within the filesystem |
+| `st_mode` | Yes | File type + permission bits (rwx, setuid, setgid, sticky) |
+| `st_nlink` | Yes | Always 1 for regular files and symlinks (no hardlinks). For directories: 2 + number of subdirectories (POSIX convention for `.` and `..`) |
+| `st_uid` | Yes | Owner user ID |
+| `st_gid` | Yes | Owner group ID |
+| `st_size` | Yes | File size in bytes; target path length for symlinks; implementation-defined for directories |
+| `st_mtime` | Yes | Last content modification time. Updated on write, truncate, create, delete (for directories) |
+| `st_ctime` | Yes | Last inode metadata change time. Updated on chmod, chown, link count change, and any operation that updates mtime |
+| `st_btime` | Yes | File creation (birth) time. Set once at inode creation; never updated. Exposed via `statx` only (not available through `stat`) |
+| `st_atime` | Synthetic | **Not stored** (constraint 2). `stat` returns `st_ctime` for POSIX compliance — since ctime is updated on every operation that updates mtime, `ctime >= mtime` always holds, making ctime the tightest available approximation. `statx` returns the same synthetic value when `STATX_ATIME` is requested, with the `STATX_ATIME` bit set in `stx_mask` |
+| `st_dev` | No | Filled by the FUSE layer at response time from the mount's device ID; not stored per-inode |
+| `st_rdev` | Reserved | Stored per-inode to avoid on-disk format changes when device file support is added. Always zero for all currently supported file types; will store major/minor device numbers for block and character devices |
+| `st_blksize` | No | Reported as a filesystem-wide constant (preferred I/O block size); not stored per-inode |
+| `st_blocks` | Derived | Computed from the actual allocated storage, not stored as an independent field |
+
+**`stat` behavior.** `stat`, `lstat`, and `fstat` return the standard `struct stat` with all fields populated as described above. Within a transaction, `stat` reflects the transaction's workspace state (including any uncommitted modifications to metadata by the calling or sibling subtransactions that have committed into the transaction).
+
+**`statx` behavior.** CastaneaFS implements the FUSE `statx` callback (available since libfuse 3.18 / kernel 6.6). `statx` is not a POSIX standard — it is Linux-specific, defined by the Linux kernel in `<linux/stat.h>`. The `stx_mask` mechanism allows CastaneaFS to advertise exactly which fields it supports:
+
+- `STATX_BASIC_STATS`: All standard stat fields (with atime synthetic as described above).
+- `STATX_BTIME`: File creation/birth time (`stx_btime`), stored per-inode.
+- `STATX_MNT_ID`: Filled by the kernel, not CastaneaFS.
+- Other `STATX_*` fields (e.g., `STATX_DIOALIGN`, `STATX_SUBVOL`): Not supported; corresponding mask bits are unset in the response.
+
+`stx_attributes_mask` is zero (no file attributes — compressed, immutable, append-only, etc. — are supported in the initial implementation).
+
+> **Future feature**: File attributes (immutable, append-only) via `stx_attributes` and `FS_IOC_SETFLAGS`/`FS_IOC_GETFLAGS` ioctls are noted for potential future inclusion.
+
+**Timestamp resolution.** All timestamps (mtime, ctime, btime) are stored with nanosecond resolution (`struct timespec` / `struct statx_timestamp`).
+
+**Timestamp conflict semantics.** Timestamps are not a conflict domain — they are side effects of content and metadata operations, not independent writes. Concurrent updates to the same inode's timestamps are merged via `max(parent_current, transaction_end)`. See Conflict Domains: Other inode metadata for the full merge semantics.
 
 ### Link Types: Design Rationale
 
@@ -486,3 +542,4 @@ Note: Rename/move across directories concurrent with content writes was consider
 - **2026-03-06**: Reframed conflict detection from pairwise sibling comparisons to current-state comparison: all domain checks (content, permission bits, ownership, security rules) compare the committing transaction's state against the parent's current committed state, which encapsulates all intermediate sibling commits regardless of their start times. This follows the pattern used by optimistic concurrency control systems generally (FoundationDB, CockroachDB, PostgreSQL SI). Documented that the permission bit reconciliation is structurally a state-based CRDT — the merge function (bitwise OR) is commutative, associative, idempotent, and monotone over the subset lattice, guaranteeing order-independent convergence and composable security checks. Replaced the pairwise sufficiency argument with a direct current-state security comparison. Added scenario verification table (11 cases) exercising the interaction of metadata reconciliation, security conflict rules, and POSIX permission checks, with worked metadata check derivations using the S/E/P model.
 - **2026-03-07**: Added directory permission semantics for Rules 1–2: both `r` (listing) and `x` (traversal) bits are independently security-relevant for directories; `w` is not (integrity concern). Documented that current ancestor-chain analysis is conservative (any single relaxation triggers conflict) with a future refinement for minimum-effective-access analysis across the chain.
 - **2026-03-07**: Renamed CLI tool from `castaneafs-admin` to `castaneafs`, following the naming convention of `btrfs` and `zfs`. Replaced "reference client" mention with explicit reference to the `castaneafs` CLI administration tool — there is no client library; CastaneaFS is accessed via standard POSIX syscalls and ioctls.
+- **2026-03-07**: Added POSIX Surface section: supported file types (regular files, directories, symlinks; FIFOs, device nodes, sockets deferred with `EPERM`), file type conflict semantics (convergent type required at same path, otherwise first-committer-wins), inode metadata fields (`struct stat` mapping, synthetic atime as ctime, birth time, `st_rdev` reserved per-inode for future device support), `stat`/`statx` behavior (`stx_mask` advertisement, `STATX_BTIME` support), timestamp resolution (nanosecond), and timestamp conflict semantics (`max` merge). Updated constraint 10 to reference the new section. Added timestamp merge rule (`max(parent_current, transaction_end)`) to the Conflict Domains "Other inode metadata" paragraph. Added FIFOs/device nodes/sockets and `stx_attributes` to future features.
