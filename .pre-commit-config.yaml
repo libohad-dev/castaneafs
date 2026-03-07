@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Ohad Livne <libohad-dev@proton.me>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+repos:
+# keep-sorted start
+- repo: https://github.com/Yelp/detect-secrets
+  rev: v1.5.0
+  hooks:
+  - id: detect-secrets
+- repo: https://github.com/fsfe/reuse-tool
+  rev: v6.2.0
+  hooks:
+  - id: reuse
+- repo: https://github.com/google/keep-sorted
+  rev: v0.6.0
+  hooks:
+  - id: keep-sorted
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  # keep-sorted start
+  - id: check-ast
+  - id: check-executables-have-shebangs
+  - id: check-yaml
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  # keep-sorted end
+- repo: https://github.com/syntaqx/git-hooks
+  rev: v0.0.18
+  hooks:
+  # keep-sorted start
+  - id: forbid-binary
+  - id: shellcheck
+  # keep-sorted end
+# keep-sorted end

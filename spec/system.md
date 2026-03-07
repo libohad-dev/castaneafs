@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Ohad Livne <libohad-dev@proton.me>
+
+SPDX-License-Identifier: CC-BY-SA-4.0
+-->
+
 # System Design
 
 ## System Overview
